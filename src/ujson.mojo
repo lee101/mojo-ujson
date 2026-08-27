@@ -1,6 +1,6 @@
 """JSON scanning, string decoding, and string encoding kernels."""
 
-from std.sys import simd_width_of
+from std.sys import simd_width_of as simdwidthof
 
 comptime BPtr = UnsafePointer[UInt8, AnyOrigin[mut=True]]
 comptime IPtr = UnsafePointer[Int, AnyOrigin[mut=True]]
@@ -57,7 +57,7 @@ def set_error(errors: IPtr, code: Int, pos: Int) -> Int:
 
 
 def copy_bytes(src: BPtr, src_start: Int, dst: BPtr, dst_start: Int, count: Int):
-    comptime W = simd_width_of[DType.float64]()
+    comptime W = simdwidthof[DType.float64]()
     comptime BYTE_W = W * 8
     var offset = 0
     while offset + BYTE_W <= count:
@@ -208,7 +208,7 @@ def mujson_parse(
             var decoded_start = string_pos
             i += 1
             var closed = False
-            comptime W = simd_width_of[DType.float64]()
+            comptime W = simdwidthof[DType.float64]()
             comptime BYTE_W = W * 8
             while i < n:
                 while i + BYTE_W <= n:
@@ -435,7 +435,40 @@ def mujson_encode(
         dst[pos] = UInt8(34)
         pos += 1
         var i = start
+        comptime W = simdwidthof[DType.float64]()
+        comptime BYTE_W = W * 8
         while i < end:
+            while i + BYTE_W <= end and pos + BYTE_W <= capacity:
+                var values = blob.load[width=BYTE_W](i)
+                var special = (
+                    values.lt(SIMD[DType.uint8, BYTE_W](32))
+                    | values.eq(SIMD[DType.uint8, BYTE_W](34))
+                    | values.eq(SIMD[DType.uint8, BYTE_W](92))
+                )
+                if escape_slashes != 0:
+                    special = special | values.eq(SIMD[DType.uint8, BYTE_W](47))
+                if encode_html != 0:
+                    special = (
+                        special
+                        | values.eq(SIMD[DType.uint8, BYTE_W](60))
+                        | values.eq(SIMD[DType.uint8, BYTE_W](62))
+                        | values.eq(SIMD[DType.uint8, BYTE_W](38))
+                    )
+                if ensure_ascii != 0:
+                    special = special | ~values.lt(SIMD[DType.uint8, BYTE_W](128))
+                if special.reduce_or():
+                    var clean = 0
+                    while clean < BYTE_W and not special[clean]:
+                        dst[pos + clean] = blob[i + clean]
+                        clean += 1
+                    i += clean
+                    pos += clean
+                    break
+                dst.store(pos, values)
+                i += BYTE_W
+                pos += BYTE_W
+            if i >= end:
+                break
             if pos + 12 > capacity:
                 return -1
             var c = Int(blob[i])

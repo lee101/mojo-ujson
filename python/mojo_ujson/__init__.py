@@ -45,8 +45,8 @@ def _input_buffer(obj: Any) -> bytes | bytearray | memoryview:
     if isinstance(obj, (bytes, bytearray)):
         return obj
     if isinstance(obj, memoryview):
-        # memoryview.__len__ is the first dimension, not the byte length, for
-        # multidimensional views.  Normalize all views to a stable byte buffer.
+        if obj.c_contiguous:
+            return obj.cast("B")
         return obj.tobytes()
     raise TypeError(f"Expected string or C-contiguous bytes-like object")
 
@@ -58,13 +58,15 @@ def loads(obj: Any) -> Any:
     if not n:
         src = np.zeros(1, dtype=np.uint8)
     capacity = n + 1
-    kinds = np.empty(capacity, dtype=np.uint8)
-    starts = np.empty(capacity, dtype=np.int64)
-    ends = np.empty(capacity, dtype=np.int64)
-    strings = np.empty(capacity, dtype=np.uint8)
-    stack_type = np.empty(capacity + 1, dtype=np.uint8)
-    stack_state = np.empty(capacity + 1, dtype=np.uint8)
-    errors = np.zeros(3, dtype=np.int64)
+    byte_work = np.empty(4 * capacity + 2, dtype=np.uint8)
+    kinds = byte_work[:capacity]
+    strings = byte_work[capacity : 2 * capacity]
+    stack_type = byte_work[2 * capacity : 3 * capacity + 1]
+    stack_state = byte_work[3 * capacity + 1 :]
+    int_work = np.empty(2 * capacity + 3, dtype=np.int64)
+    starts = int_work[:capacity]
+    ends = int_work[capacity : 2 * capacity]
+    errors = int_work[2 * capacity :]
 
     count = lib().mujson_parse(
         _addr(src, np.dtype(np.uint8)),
@@ -108,17 +110,24 @@ def loads(obj: Any) -> Any:
             inner_start = ends_view[0]
             inner_end = starts_view[count - 1]
             numeric_text = bytes(source_view[inner_start:inner_end])
-            numeric_values = np.fromstring(numeric_text, sep=",")
+            numeric_values = list(map(float, numeric_text.split(b",")))
             if len(numeric_values) == count - 2:
-                return numeric_values.tolist()
+                return numeric_values
         if np.all(inner_kinds == K_STRING):
             try:
-                return [
-                    bytes(string_view[starts_view[event] : ends_view[event]]).decode(
-                        "utf-8", "surrogatepass"
+                decoded: list[str] = []
+                decoded_cache: dict[bytes, str] = {}
+                for event in range(1, count - 1):
+                    encoded = bytes(
+                        string_view[starts_view[event] : ends_view[event]]
                     )
-                    for event in range(1, count - 1)
-                ]
+                    value = decoded_cache.get(encoded)
+                    if value is None:
+                        value = encoded.decode("utf-8", "surrogatepass")
+                        if len(decoded_cache) < 1024:
+                            decoded_cache[encoded] = value
+                    decoded.append(value)
+                return decoded
             except UnicodeError as exc:
                 raise JSONDecodeError(str(exc)) from None
     containers: list[Any] = []
@@ -191,13 +200,15 @@ decode = loads
 
 
 class _TokenWriter:
-    __slots__ = ("blob", "kinds", "starts", "ends")
+    __slots__ = ("blob", "kinds", "starts", "ends", "key_data", "long_strings")
 
     def __init__(self) -> None:
         self.blob = bytearray()
         self.kinds: list[int] = []
         self.starts: list[int] = []
         self.ends: list[int] = []
+        self.key_data: dict[str, bytes] = {}
+        self.long_strings: dict[str, bytes] = {}
 
     def raw(self, value: str) -> None:
         start = len(self.blob)
@@ -213,7 +224,14 @@ class _TokenWriter:
             self.ends.append(len(self.blob))
 
     def string(self, value: str, kind: int = 1) -> None:
-        data = value.encode("utf-8", "surrogatepass")
+        if len(value) >= 32:
+            data = self.long_strings.get(value)
+            if data is None:
+                data = value.encode("utf-8", "surrogatepass")
+                if len(self.long_strings) < 64:
+                    self.long_strings[value] = data
+        else:
+            data = value.encode("utf-8", "surrogatepass")
         start = len(self.blob)
         self.blob.extend(data)
         self.kinds.append(kind)
@@ -221,7 +239,11 @@ class _TokenWriter:
         self.ends.append(len(self.blob))
 
     def key(self, value: str, leading_comma: bool) -> None:
-        data = value.encode("utf-8", "surrogatepass")
+        data = self.key_data.get(value)
+        if data is None:
+            data = value.encode("utf-8", "surrogatepass")
+            if len(self.key_data) < 1024:
+                self.key_data[value] = data
         start = len(self.blob)
         self.blob.extend(data)
         self.kinds.append(4 if leading_comma else 3)
@@ -305,11 +327,12 @@ def dumps(
             if indent_width == 0 and value:
                 first_type = type(value[0])
                 if first_type is float and all(type(item) is float for item in value):
-                    writer.raw(
-                        "[" + ",".join(
+                    body = ",".join(map(repr, value))
+                    if "e" in body or "nan" in body or "inf" in body:
+                        body = ",".join(
                             _float_text(item, bool(allow_nan)) for item in value
-                        ) + "]"
-                    )
+                        )
+                    writer.raw("[" + body + "]")
                     active.remove(identity)
                     return
                 if first_type is str and all(type(item) is str for item in value):

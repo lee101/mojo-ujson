@@ -89,16 +89,22 @@ escaping into a preallocated output buffer. All kernels live in one compilation
 unit to keep Mojo build overhead fixed.
 
 Clean string runs and raw output spans use full-width SIMD loads and stores with
-scalar tail handling. Input `bytes` and `bytearray` objects and the flattened
-encoding blob stay zero-copy across the FFI boundary; `memoryview` inputs are
-normalized to bytes so multidimensional views have an unambiguous byte length.
-Homogeneous top-level float and string arrays are materialized in bulk after the
-Mojo parser has validated the complete document.
+scalar tail handling. The escaping mask includes quotes, backslashes, control
+bytes, non-ASCII bytes when required, forward slashes, and HTML characters, so
+all encoding options retain the same SIMD path. Input `bytes`, `bytearray`, and
+contiguous `memoryview` objects and the flattened encoding blob stay zero-copy
+across the FFI boundary; non-contiguous views are normalized to bytes. Parser
+work buffers use two contiguous NumPy arenas instead of seven independent
+allocations. Homogeneous top-level float and string arrays are materialized in
+bulk after the Mojo parser has validated the complete document, with bounded
+caches avoiding repeated UTF-8 encoding and decoding.
 
 There is no parallel or GPU path. JSON grammar state and escaped-output offsets
-are sequential, and the independent scanning and copy work is memory-bound.
-Thread launch overhead and GPU allocation, transfer, and synchronization are
-outside the scope of this port.
+are sequential, while the independent scanning and copy work has far below two
+operations per byte and is memory-bound. CPU thread launch overhead would exceed
+the available independent work at these payload sizes. A GPU path would add
+allocation, transfer, and synchronization to a low-arithmetic-intensity kernel,
+so it is intentionally skipped rather than exposing a path that loses.
 
 ## Benchmarks
 
@@ -107,16 +113,20 @@ Linux x86-64, Python 3.13.14, and upstream ujson 5.13.0:
 
 | Operation | Payload | mojo-ujson | ujson | Relative |
 |---|---:|---:|---:|---:|
-| loads: records | 4.92 MB | 799.07 ms | 103.19 ms | 0.13x |
-| loads: numeric array | 2.08 MB | 56.44 ms | 30.46 ms | 0.54x |
-| loads: string array | 4.05 MB | 70.11 ms | 23.65 ms | 0.34x |
-| dumps: records | 50,000 objects | 778.46 ms | 99.04 ms | 0.13x |
-| dumps: numeric array | 250,000 floats | 148.20 ms | 40.97 ms | 0.28x |
-| dumps: strings | 50,000 strings | 62.00 ms | 20.39 ms | 0.33x |
+| loads: records | 4.92 MB | 608.76 ms | 84.78 ms | 0.14x |
+| loads: numeric array | 2.08 MB | 51.78 ms | 26.17 ms | 0.51x |
+| loads: string array | 4.05 MB | 43.96 ms | 22.89 ms | 0.52x |
+| dumps: records | 50,000 objects | 692.19 ms | 49.93 ms | 0.07x |
+| dumps: numeric array | 250,000 floats | 108.39 ms | 41.04 ms | 0.38x |
+| dumps: strings | 50,000 strings | 51.36 ms | 20.30 ms | 0.40x |
 
 Relative is upstream time divided by mojo-ujson time, so values above 1.00x
 favor mojo-ujson. Mojo-ujson is slower in every end-to-end case measured here.
 Upstream constructs CPython objects directly inside its mature C extension;
 this port pays for NumPy work buffers and Python-level event or object traversal.
 The string-heavy cases narrow that gap because a larger fraction of the work
-runs inside the Mojo kernels.
+runs inside the Mojo kernels. Against the locked baseline taken immediately
+before these changes, string-array loads improved from 75.70 ms to 43.96 ms,
+numeric-array dumps from 144.33 ms to 108.39 ms, and string-array dumps from
+69.73 ms to 51.36 ms. Record loads regressed from 586.14 ms to 608.76 ms; their
+Python object construction remains the dominant cost.

@@ -9,6 +9,7 @@ import pytest
 import ujson as upstream
 
 import mojo_ujson as mojo
+from mojo_ujson import _input_buffer
 
 
 @pytest.mark.parametrize(
@@ -161,6 +162,9 @@ def test_loads_accepts_bytes_bytearray_and_memoryview():
 def test_loads_accepts_multidimensional_contiguous_memoryview():
     array = np.frombuffer(b"[1,2] ", dtype=np.uint8).reshape(2, 3)
     value = memoryview(array)
+    normalized = _input_buffer(value)
+    assert isinstance(normalized, memoryview)
+    assert normalized.obj is array
     assert mojo.loads(value) == upstream.loads(value) == [1, 2]
 
 
@@ -267,6 +271,20 @@ def test_simd_string_scan_and_copy_tails(length):
     assert mojo.dumps(value) == encoded
 
 
+@pytest.mark.parametrize("length", [31, 32, 33, 63, 64, 65])
+@pytest.mark.parametrize(
+    "options",
+    [
+        {"ensure_ascii": False, "escape_forward_slashes": False},
+        {"ensure_ascii": True, "escape_forward_slashes": False},
+        {"ensure_ascii": False, "encode_html_chars": True},
+    ],
+)
+def test_simd_encode_option_masks_and_tails(length, options):
+    value = "a" * length + "é/<>" + "b" * length
+    assert mojo.dumps(value, **options) == upstream.dumps(value, **options)
+
+
 def test_bulk_float_and_string_array_decode_parity():
     documents = [
         "[0.0,-0.0,1.2345678901234567,1e-300,1e+300]",
@@ -274,6 +292,15 @@ def test_bulk_float_and_string_array_decode_parity():
     ]
     for document in documents:
         assert mojo.loads(document) == upstream.loads(document)
+
+    repeated = ["repeated café / value"] * 2048
+    document = upstream.dumps(repeated, ensure_ascii=False)
+    assert mojo.loads(document) == repeated
+
+
+def test_bulk_finite_float_array_encode_parity():
+    value = [index * 0.25 for index in range(4096)]
+    assert mojo.dumps(value) == upstream.dumps(value)
 
 
 def test_large_empty_string_array_does_not_underallocate_output():
